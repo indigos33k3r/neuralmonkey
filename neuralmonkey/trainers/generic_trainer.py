@@ -1,9 +1,11 @@
-from typing import Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import Dict, List, NamedTuple, Optional, Tuple, Union, Set
 import re
 
 import tensorflow as tf
 
-from neuralmonkey.model.model_part import ModelPart
+from neuralmonkey.model.model_part import GenericModelPart
+from neuralmonkey.model.feedable import Feedable
+from neuralmonkey.model.parameterized import Parameterized
 from neuralmonkey.runners.base_runner import (
     Executable, ExecutionResult, NextExecute)
 
@@ -18,7 +20,7 @@ BIAS_REGEX = re.compile(r"[Bb]ias")
 class Objective(NamedTuple(
         "Objective",
         [("name", str),
-         ("decoder", ModelPart),
+         ("decoder", GenericModelPart),
          ("loss", tf.Tensor),
          ("gradients", Optional[Gradients]),
          ("weight", ObjectiveWeight)])):
@@ -39,6 +41,7 @@ class Objective(NamedTuple(
 # pylint: disable=too-few-public-methods,too-many-locals,too-many-arguments
 class GenericTrainer:
 
+    # pylint: disable=too-many-branches
     def __init__(self,
                  objectives: List[Objective],
                  l1_weight: float = 0.0,
@@ -133,8 +136,13 @@ class GenericTrainer:
                              for grad, var in gradients
                              if grad is not None]
 
-            self.all_coders = set.union(*(obj.decoder.get_dependencies()
-                                          for obj in objectives))
+            self.feedables = set()  # type: Set[Feedable]
+            self.parameterizeds = set()  # type: Set[Parameterized]
+
+            for obj in objectives:
+                feeds, params = obj.decoder.get_dependencies()
+                self.feedables |= feeds
+                self.parameterizeds |= params
 
             self.train_op = self.optimizer.apply_gradients(
                 gradients, global_step=step)
@@ -149,17 +157,19 @@ class GenericTrainer:
                 tf.get_collection("summary_gradients"))
             self.scalar_summaries = tf.summary.merge(
                 tf.get_collection("summary_train"))
+    # pylint: enable=too-many-branches
 
     def _get_gradients(self, tensor: tf.Tensor) -> Gradients:
         gradient_list = self.optimizer.compute_gradients(tensor, self.var_list)
         return gradient_list
 
     def get_executable(
-            self, compute_losses=True, summaries=True,
-            num_sessions=1) -> Executable:
+            self, compute_losses: bool = True, summaries: bool = True,
+            num_sessions: int = 1) -> Executable:
         assert compute_losses
 
-        return TrainExecutable(self.all_coders,
+        return TrainExecutable(self.feedables,
+                               self.parameterizeds,
                                num_sessions,
                                self.train_op,
                                self.losses,
@@ -194,17 +204,24 @@ def _scale_gradients(gradients: Gradients,
 
 class TrainExecutable(Executable):
 
-    def __init__(self, all_coders, num_sessions,
-                 train_op, losses, scalar_summaries,
-                 histogram_summaries):
-        self.all_coders = all_coders
+    def __init__(self,
+                 feedables: Set[Feedable],
+                 parameterizeds: Set[Parameterized],
+                 num_sessions: int,
+                 train_op: tf.Operation,
+                 losses: List[tf.Tensor],
+                 scalar_summaries: tf.Tensor,
+                 histogram_summaries: tf.Tensor) -> None:
+
+        self.feedables = feedables
+        self.parameterizeds = parameterizeds
         self.num_sessions = num_sessions
         self.train_op = train_op
         self.losses = losses
         self.scalar_summaries = scalar_summaries
         self.histogram_summaries = histogram_summaries
 
-        self.result = None
+        self._result = None  # type: Optional[ExecutionResult]
 
     def next_to_execute(self) -> NextExecute:
         fetches = {"train_op": self.train_op}
@@ -214,7 +231,7 @@ class TrainExecutable(Executable):
         fetches["losses"] = self.losses
         fetches["_update_ops"] = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
 
-        return self.all_coders, fetches, [{} for _ in range(self.num_sessions)]
+        return self.feedables, fetches, [{} for _ in range(self.num_sessions)]
 
     def collect_results(self, results: List[Dict]) -> None:
         if self.scalar_summaries is None:
@@ -232,7 +249,7 @@ class TrainExecutable(Executable):
                 losses_sum[i] += session_result["losses"][i]
         avg_losses = [s / len(results) for s in losses_sum]
 
-        self.result = ExecutionResult(
+        self._result = ExecutionResult(
             [], losses=avg_losses,
             scalar_summaries=scalar_summaries,
             histogram_summaries=histogram_summaries,
